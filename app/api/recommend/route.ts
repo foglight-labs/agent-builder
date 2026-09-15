@@ -1,13 +1,27 @@
-import catalog from "@/data/skills.json";
-import { systemPrompt, type CatalogSkill, type Recommendation } from "@/lib/prompt";
+import { systemPrompt, type Recommendation } from "@/lib/prompt";
+import { getSkillsByNames, type SkillSummary } from "@/lib/skills";
+import { runTool, tools } from "@/lib/tools";
 
-const SOURCE = "mattpocock/skills";
+const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
 const MODEL = process.env.OPENROUTER_MODEL || "anthropic/claude-sonnet-4.5";
+const MAX_TOOL_ROUNDS = 8;
+
+type ToolCall = { id: string; type: "function"; function: { name: string; arguments: string } };
+
+type Message =
+  | { role: "system" | "user"; content: string }
+  | { role: "assistant"; content: string; tool_calls?: ToolCall[] }
+  | { role: "tool"; tool_call_id: string; content: string };
+
+type AssistantReply = { content?: string | null; tool_calls?: ToolCall[] };
 
 export async function POST(request: Request) {
   const apiKey = process.env.OPENROUTER_API_KEY;
   if (!apiKey) {
     return Response.json({ error: "OPENROUTER_API_KEY is not set" }, { status: 500 });
+  }
+  if (!process.env.DATABASE_URL) {
+    return Response.json({ error: "DATABASE_URL is not set" }, { status: 500 });
   }
 
   const { task } = (await request.json().catch(() => ({}))) as { task?: string };
@@ -15,31 +29,31 @@ export async function POST(request: Request) {
     return Response.json({ error: "task is required" }, { status: 400 });
   }
 
-  const skills = catalog as CatalogSkill[];
+  const messages: Message[] = [
+    { role: "system", content: systemPrompt },
+    { role: "user", content: task.trim() },
+  ];
 
-  const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: MODEL,
-      messages: [
-        { role: "system", content: systemPrompt(skills) },
-        { role: "user", content: task.trim() },
-      ],
-      response_format: { type: "json_object" },
-    }),
-  });
+  let content = "";
+  try {
+    for (let round = 0; ; round++) {
+      // After MAX_TOOL_ROUNDS, force a final answer instead of more tool calls.
+      const forceAnswer = round >= MAX_TOOL_ROUNDS;
+      const reply = await chat(apiKey, messages, forceAnswer);
+      const calls = reply.tool_calls ?? [];
 
-  if (!res.ok) {
-    const text = await res.text();
-    return Response.json({ error: `OpenRouter ${res.status}: ${text}` }, { status: 502 });
+      if (forceAnswer || calls.length === 0) {
+        content = reply.content ?? "";
+        break;
+      }
+
+      messages.push({ role: "assistant", content: reply.content ?? "", tool_calls: calls });
+      const results = await Promise.all(calls.map((c) => runTool(c.function.name, c.function.arguments)));
+      calls.forEach((c, i) => messages.push({ role: "tool", tool_call_id: c.id, content: results[i] }));
+    }
+  } catch (err) {
+    return Response.json({ error: err instanceof Error ? err.message : String(err) }, { status: 502 });
   }
-
-  const data = await res.json();
-  const content: string = data?.choices?.[0]?.message?.content ?? "";
 
   let parsed: { skills?: Recommendation[] };
   try {
@@ -48,35 +62,73 @@ export async function POST(request: Request) {
     return Response.json({ error: "Model returned invalid JSON", raw: content }, { status: 502 });
   }
 
-  const byName = new Map(skills.map((s) => [s.name, s]));
+  const recommendations = (parsed.skills ?? []).filter((r) => r && typeof r.name === "string");
+  let byName: Map<string, SkillSummary>;
+  try {
+    const rows = await getSkillsByNames(recommendations.map((r) => r.name));
+    byName = new Map(rows.map((s) => [s.name, s]));
+  } catch (err) {
+    return Response.json({ error: err instanceof Error ? err.message : String(err) }, { status: 502 });
+  }
+
   const seen = new Set<string>();
-  const picked = (parsed.skills ?? [])
+  const picked = recommendations
     .filter((r) => byName.has(r.name) && !seen.has(r.name) && seen.add(r.name))
-    .map((r) => ({
-      name: r.name,
-      reason: r.reason ?? "",
-      setup: r.setup ?? "",
-      url: byName.get(r.name)!.url,
-    }));
+    .map((r) => {
+      const row = byName.get(r.name)!;
+      return {
+        name: row.name,
+        source: row.source,
+        reason: r.reason ?? "",
+        setup: r.setup ?? "",
+        url: row.url,
+      };
+    });
 
   if (picked.length === 0) {
     return Response.json({ error: "No matching skills recommended", raw: content }, { status: 502 });
   }
 
+  const sources = [...new Set(picked.map((s) => s.source))];
   const script = [
     "#!/usr/bin/env bash",
     `# Skill pack for: ${task.trim().replace(/\s+/g, " ")}`,
-    `# Source: https://github.com/${SOURCE}`,
+    `# Sources: ${sources.join(", ")}`,
     "set -e",
     "",
     ...picked.flatMap((s) => [
       `# ${s.name}: ${s.reason}`,
-      `npx skills add ${SOURCE} --skill ${s.name} -y`,
+      `npx skills add ${s.source} --skill ${s.name} -y`,
       "",
     ]),
   ].join("\n");
 
   return Response.json({ skills: picked, script });
+}
+
+async function chat(apiKey: string, messages: Message[], forceAnswer: boolean): Promise<AssistantReply> {
+  const res = await fetch(OPENROUTER_URL, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: MODEL,
+      messages,
+      tools,
+      tool_choice: forceAnswer ? "none" : "auto",
+    }),
+  });
+
+  if (!res.ok) {
+    throw new Error(`OpenRouter ${res.status}: ${await res.text()}`);
+  }
+
+  const data = await res.json();
+  const reply = data?.choices?.[0]?.message as AssistantReply | undefined;
+  if (!reply) throw new Error("OpenRouter returned no message");
+  return reply;
 }
 
 function extractJson(text: string): string {
