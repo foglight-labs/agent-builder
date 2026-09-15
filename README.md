@@ -37,3 +37,17 @@ Then point `DATABASE_URL` at the database as `skills_reader` (see `.env.example`
 - `get_skill_file(skill, path)` — read a file (default `SKILL.md`).
 
 Picked names are validated against the database before the install script is generated.
+
+## Run logs
+Every `POST /api/recommend` call emits exactly one structured JSON line to stdout, tagged `"event":"run"`, containing:
+- `input`/`output`: the task and the final recommendation (or `error` with the failing `stage`: `model`, `parse`, `validate`, or `no_matches`).
+- `version`: `git_commit` (+ `git_dirty` locally), `prompt_hash` (hash of the system prompt and tool schemas, so you can tell prompt changes apart even between commits), and the requested/served model.
+- `trace`: every model round and tool call, with arguments and a truncated (2,000 char) preview of each tool result. If the whole record would exceed ~100KB it's marked `trace.trimmed: true` and previews are dropped, to stay under platform per-log-line limits.
+
+There is no database for this; it relies on your platform's log capture (Railway logs, or Cloudflare Workers Logs — enable `observability.enabled` in your Wrangler config). The response body also includes `run_id` so you can correlate a request with its log line.
+
+Locally, read it straight from the `next dev` terminal, or filter it:
+```bash
+npm run dev | grep '"event":"run"' | jq
+```
+Set `RUN_LOG_DIR=runs` in `.env.local` to also write each record to `runs/<run_id>.json` for easier local inspection (gitignored).
