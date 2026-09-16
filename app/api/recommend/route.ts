@@ -1,7 +1,6 @@
 import { systemPrompt } from "@/lib/prompt";
-import { tools } from "@/lib/tools";
 import { describeError, MAX_TOOL_ROUNDS, MODEL, recommend, RecommendError } from "@/lib/recommend";
-import { logRun, newRunId, promptHash, type RunRecord } from "@/lib/run-log";
+import { logRun, newRunId, type RunRecord } from "@/lib/run-log";
 
 export async function POST(request: Request) {
   const apiKey = process.env.OPENROUTER_API_KEY;
@@ -27,12 +26,14 @@ export async function POST(request: Request) {
       git_commit: process.env.GIT_COMMIT || "unknown",
       git_dirty: process.env.GIT_DIRTY || "unknown",
       app_version: "0.1.0",
-      prompt_hash: await promptHash(systemPrompt, tools),
+      // Set by recommend() once it lists the live MCP tool schemas, so the
+      // hash always reflects what the model actually saw, not a static copy.
+      prompt_hash: "",
       model_requested: MODEL,
       max_tool_rounds: MAX_TOOL_ROUNDS,
     },
     input: { task: trimmedTask },
-    trace: { system_prompt: systemPrompt, rounds: [], trimmed: false },
+    trace: { system_prompt: systemPrompt, rounds: [], tool_call_count: 0, trimmed: false },
   };
 
   try {
