@@ -67,7 +67,7 @@ export async function recommend(task: string, apiKey: string, run: RunRecord): P
     try {
       reply = await chat(apiKey, messages, toolChoice);
     } catch (err) {
-      throw new RecommendError("model", err instanceof Error ? err.message : String(err), 502);
+      throw new RecommendError("model", describeError(err), 502);
     }
     const roundLatency = Date.now() - roundStarted;
 
@@ -102,23 +102,29 @@ export async function recommend(task: string, apiKey: string, run: RunRecord): P
 
     messages.push({ role: "assistant", content: reply.content ?? "", tool_calls: calls });
 
-    const results = await Promise.all(
-      calls.map(async (c) => {
-        const started = Date.now();
-        const result = await runTool(c.function.name, c.function.arguments);
-        const latency_ms = Date.now() - started;
-        const { text, truncated, chars } = truncate(result);
-        roundTrace.tool_results.push({
-          tool_call_id: c.id,
-          name: c.function.name,
-          latency_ms,
-          chars,
-          truncated,
-          result: text,
-        });
-        return result;
-      })
-    );
+    let results: string[];
+    try {
+      results = await Promise.all(
+        calls.map(async (c) => {
+          const started = Date.now();
+          const result = await runTool(c.function.name, c.function.arguments);
+          const latency_ms = Date.now() - started;
+          const { text, truncated, chars } = truncate(result);
+          roundTrace.tool_results.push({
+            tool_call_id: c.id,
+            name: c.function.name,
+            latency_ms,
+            chars,
+            truncated,
+            result: text,
+          });
+          return result;
+        })
+      );
+    } catch (err) {
+      const names = [...new Set(calls.map((c) => c.function.name))].join(", ");
+      throw new RecommendError("tool", `Tool execution failed (${names}): ${describeError(err)}`, 502);
+    }
     calls.forEach((c, i) => messages.push({ role: "tool", tool_call_id: c.id, content: results[i] }));
   }
 
@@ -139,7 +145,7 @@ export async function recommend(task: string, apiKey: string, run: RunRecord): P
     const rows = await getSkillsByNames(recommendations.map((r) => r.name));
     byName = new Map(rows.map((s) => [s.name, s]));
   } catch (err) {
-    throw new RecommendError("validate", err instanceof Error ? err.message : String(err), 502);
+    throw new RecommendError("validate", describeError(err), 502);
   }
 
   const seen = new Set<string>();
@@ -205,6 +211,27 @@ async function chat(apiKey: string, messages: Message[], toolChoice: "auto" | "n
         }
       : undefined,
   };
+}
+
+/**
+ * Flatten an unknown throwable into a message worth logging. Node wraps
+ * multi-address connection failures in an `AggregateError` whose own `message`
+ * is empty, so the sub-errors and any `cause` chain have to be unwrapped
+ * explicitly or the log just reads "AggregateError".
+ */
+export function describeError(err: unknown): string {
+  if (err instanceof AggregateError) {
+    const parts = err.errors.map(describeError).filter(Boolean);
+    const detail = [...new Set(parts)].join("; ");
+    return err.message ? `${err.message}: ${detail}` : detail || "AggregateError with no sub-errors";
+  }
+  if (err instanceof Error) {
+    const code = (err as NodeJS.ErrnoException).code;
+    const base = err.message || err.name;
+    const withCode = code && !base.includes(code) ? `${base} (${code})` : base;
+    return err.cause ? `${withCode} <- ${describeError(err.cause)}` : withCode;
+  }
+  return String(err);
 }
 
 function parseArgsForTrace(raw: string): unknown {

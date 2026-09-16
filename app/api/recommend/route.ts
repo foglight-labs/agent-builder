@@ -1,6 +1,6 @@
 import { systemPrompt } from "@/lib/prompt";
 import { tools } from "@/lib/tools";
-import { MAX_TOOL_ROUNDS, MODEL, recommend, RecommendError } from "@/lib/recommend";
+import { describeError, MAX_TOOL_ROUNDS, MODEL, recommend, RecommendError } from "@/lib/recommend";
 import { logRun, newRunId, promptHash, type RunRecord } from "@/lib/run-log";
 
 export async function POST(request: Request) {
@@ -40,7 +40,7 @@ export async function POST(request: Request) {
     run.output = result;
     return Response.json({ skills: result.skills, script: result.script, run_id: run.id });
   } catch (err) {
-    const recErr = err instanceof RecommendError ? err : new RecommendError("unknown", String(err), 502);
+    const recErr = err instanceof RecommendError ? err : new RecommendError("unknown", describeError(err), 502);
     run.status = "error";
     run.error = { stage: recErr.stage, message: recErr.message };
     const body: { error: string; raw?: string; run_id: string } = { error: recErr.message, run_id: run.id };
