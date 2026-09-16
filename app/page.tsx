@@ -60,7 +60,14 @@ export default function Home() {
 
       {error && <p className="error">{error}</p>}
 
-      {result && (
+      {result && result.skills.length === 0 && (
+        <section>
+          <h2>No matches</h2>
+          <p>Nothing in the catalog matched that query. Try different keywords.</p>
+        </section>
+      )}
+
+      {result && result.skills.length > 0 && (
         <section>
           <h2>Recommended pack</h2>
           <ul>

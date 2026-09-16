@@ -1,7 +1,14 @@
 import { getSql } from "@/lib/db";
 
+/**
+ * Skills are addressed as `source/name` (e.g. `vercel-labs/agent-skills/web-design-guidelines`).
+ * `source` is itself often `owner/repo`, so only the *last* slash separates it from `name`;
+ * skill names are slugs and never contain one.
+ */
+export type SkillId = string;
+
 export type SkillSummary = {
-  id: string;
+  id: SkillId;
   source: string;
   name: string;
   description: string;
@@ -10,120 +17,130 @@ export type SkillSummary = {
 
 export type SkillDetail = SkillSummary & {
   metadata: Record<string, unknown>;
-  created_at: Date;
-  updated_at: Date;
+  updated_at: string;
   files: { path: string; size_bytes: number }[];
+  /** Ready-to-run `npx skills` commands, so a caller never has to build them. */
+  install: string;
+  use_once: string;
 };
 
-export type SkillFile = {
-  skill: string;
-  path: string;
-  size_bytes: number;
-  content: string;
-  truncated: boolean;
-};
+export type GetSkillResult =
+  | { kind: "found"; skill: SkillDetail }
+  | { kind: "not_found" }
+  | { kind: "ambiguous"; candidates: SkillId[] };
 
 const DEFAULT_LIMIT = 20;
 const MAX_LIMIT = 50;
-const MAX_FILE_CHARS = 16_000;
 
-/** Turn free text into ILIKE patterns, one per whitespace-separated term. */
-function likePatterns(query: string): string[] {
-  return query
-    .split(/\s+/)
-    .filter(Boolean)
-    .map((term) => `%${term.replace(/[\\%_]/g, (c) => `\\${c}`)}%`);
+function toSummary(row: { source: string; name: string; description: string; url: string }): SkillSummary {
+  return { id: `${row.source}/${row.name}`, ...row };
 }
 
 /**
- * Keyword search on name/description. Terms are OR-ed; rows are ranked by how
- * many terms matched. An empty query lists the catalog alphabetically.
+ * Split a `source/name` id at its *last* slash. A bare name (no slash) comes
+ * back with `source: undefined`, which callers resolve across all sources.
+ */
+function parseSkillId(id: string): { source?: string; name: string } {
+  const trimmed = id.trim();
+  const idx = trimmed.lastIndexOf("/");
+  if (idx <= 0 || idx === trimmed.length - 1) return { name: trimmed };
+  return { source: trimmed.slice(0, idx), name: trimmed.slice(idx + 1) };
+}
+
+/**
+ * Full-text search over name + description, ranked by relevance. Terms are
+ * parsed with `websearch_to_tsquery` (the same syntax as a search engine box:
+ * quotes, `-exclude`, `or`). An empty query lists the catalog alphabetically.
  */
 export async function searchSkills(query: string, limit = DEFAULT_LIMIT): Promise<SkillSummary[]> {
   const sql = getSql();
   const n = Math.min(Math.max(Math.trunc(limit) || DEFAULT_LIMIT, 1), MAX_LIMIT);
-  const patterns = likePatterns(query);
+  const q = query.trim();
 
-  if (patterns.length === 0) {
-    return sql<SkillSummary[]>`
-      select id, source, name, description, url
-      from skills
-      order by name, source
-      limit ${n}
-    `;
-  }
+  const rows = q
+    ? await sql<{ source: string; name: string; description: string; url: string }[]>`
+        select source, name, description, url
+        from skills
+        where to_tsvector('english', name || ' ' || description) @@ websearch_to_tsquery('english', ${q})
+        order by
+          ts_rank(to_tsvector('english', name || ' ' || description), websearch_to_tsquery('english', ${q})) desc,
+          name, source
+        limit ${n}
+      `
+    : await sql<{ source: string; name: string; description: string; url: string }[]>`
+        select source, name, description, url
+        from skills
+        order by name, source
+        limit ${n}
+      `;
 
-  return sql<SkillSummary[]>`
-    select id, source, name, description, url
-    from skills
-    where name ilike any (${patterns}::text[])
-       or description ilike any (${patterns}::text[])
-    order by (
-      select count(*)
-      from unnest(${patterns}::text[]) as p
-      where skills.name ilike p or skills.description ilike p
-    ) desc, name, source
-    limit ${n}
-  `;
+  return rows.map(toSummary);
 }
 
-/** Full record for one skill, including the list of files it ships. */
-export async function getSkill(name: string): Promise<SkillDetail | null> {
+/**
+ * Full record for one skill: metadata, the files it ships, and ready-to-run
+ * install commands. `id` may be a bare name if the caller doesn't know the
+ * source yet; if that name exists under several sources, every matching id
+ * comes back in `candidates` instead of a skill.
+ */
+export async function getSkill(id: string): Promise<GetSkillResult> {
+  const { source, name } = parseSkillId(id);
   const sql = getSql();
-  const rows = await sql<SkillDetail[]>`
-    select
-      s.id, s.source, s.name, s.description, s.url, s.metadata, s.created_at, s.updated_at,
-      coalesce(
-        (
-          select json_agg(json_build_object('path', f.path, 'size_bytes', octet_length(f.content)) order by f.path)
-          from skill_files f
-          where f.skill_id = s.id
-        ),
-        '[]'::json
-      ) as files
-    from skills s
-    where s.name = ${name}
-    order by s.source
-    limit 1
-  `;
-  return rows[0] ?? null;
-}
 
-/** One file of a skill decoded as UTF-8 text (truncated if very long). */
-export async function getSkillFile(name: string, path = "SKILL.md"): Promise<SkillFile | null> {
-  const sql = getSql();
-  const rows = await sql<{ content: Uint8Array; size_bytes: number }[]>`
-    select f.content, octet_length(f.content) as size_bytes
-    from skill_files f
-    join skills s on s.id = f.skill_id
-    where s.name = ${name} and f.path = ${path}
-    order by s.source
-    limit 1
-  `;
+  const rows = source
+    ? await sql<
+        { db_id: string; source: string; name: string; description: string; url: string; metadata: Record<string, unknown>; updated_at: Date }[]
+      >`
+        select id as db_id, source, name, description, url, metadata, updated_at
+        from skills
+        where source = ${source} and name = ${name}
+        limit 1
+      `
+    : await sql<
+        { db_id: string; source: string; name: string; description: string; url: string; metadata: Record<string, unknown>; updated_at: Date }[]
+      >`
+        select id as db_id, source, name, description, url, metadata, updated_at
+        from skills
+        where name = ${name}
+        order by source
+      `;
+
+  if (rows.length === 0) return { kind: "not_found" };
+  if (rows.length > 1) return { kind: "ambiguous", candidates: rows.map((r) => `${r.source}/${r.name}`) };
+
   const row = rows[0];
-  if (!row) return null;
+  const files = await sql<{ path: string; size_bytes: number }[]>`
+    select path, octet_length(content) as size_bytes
+    from skill_files
+    where skill_id = ${row.db_id}
+    order by path
+  `;
 
-  const text = Buffer.from(row.content).toString("utf8");
-  const truncated = text.length > MAX_FILE_CHARS;
   return {
-    skill: name,
-    path,
-    size_bytes: row.size_bytes,
-    content: truncated
-      ? `${text.slice(0, MAX_FILE_CHARS)}\n…[truncated ${text.length - MAX_FILE_CHARS} more characters]`
-      : text,
-    truncated,
+    kind: "found",
+    skill: {
+      id: `${row.source}/${row.name}`,
+      source: row.source,
+      name: row.name,
+      description: row.description,
+      url: row.url,
+      metadata: row.metadata,
+      updated_at: row.updated_at.toISOString(),
+      files,
+      install: `npx skills add ${row.source} --skill ${row.name} -y`,
+      use_once: `npx skills use ${row.source}@${row.name}`,
+    },
   };
 }
 
-/** Resolve model-picked names back to catalog rows (one row per name). */
-export async function getSkillsByNames(names: string[]): Promise<SkillSummary[]> {
-  if (names.length === 0) return [];
+/** Resolve model-picked ids back to catalog rows (one row per id, silently dropping unknown ones). */
+export async function getSkillsByIds(ids: string[]): Promise<SkillSummary[]> {
+  if (ids.length === 0) return [];
   const sql = getSql();
-  return sql<SkillSummary[]>`
-    select distinct on (name) id, source, name, description, url
+  const rows = await sql<{ source: string; name: string; description: string; url: string }[]>`
+    select source, name, description, url
     from skills
-    where name = any (${names}::text[])
-    order by name, source
+    where (source || '/' || name) = any (${ids}::text[])
   `;
+  return rows.map(toSummary);
 }

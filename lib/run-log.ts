@@ -23,6 +23,8 @@ export type ToolResultTrace = {
 export type RoundTrace = {
   index: number;
   tool_choice: "auto" | "none";
+  /** True for the extra round spent asking the model to re-emit valid JSON. */
+  repair?: boolean;
   latency_ms: number;
   generation_id?: string;
   usage?: { prompt_tokens?: number; completion_tokens?: number; cost?: number };
@@ -55,9 +57,15 @@ export type RunRecord = {
   trace: {
     system_prompt: string;
     rounds: RoundTrace[];
+    /**
+     * Tool calls executed across every round. `0` means the agent answered
+     * without ever searching the catalog, which is the difference between
+     * "nothing matched" and "we never looked".
+     */
+    tool_call_count: number;
     final_content?: string;
-    recommended_names?: string[];
-    dropped_names?: string[];
+    recommended_ids?: string[];
+    dropped_ids?: string[];
     trimmed: boolean;
   };
   usage_total?: { prompt_tokens: number; completion_tokens: number; cost: number };

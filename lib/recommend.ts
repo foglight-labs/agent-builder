@@ -1,7 +1,9 @@
+import { Client } from "@modelcontextprotocol/client";
+import { InMemoryTransport } from "@modelcontextprotocol/client";
 import { systemPrompt, type Recommendation } from "@/lib/prompt";
-import { getSkillsByNames, type SkillSummary } from "@/lib/skills";
-import { runTool, tools } from "@/lib/tools";
-import { truncate, type RoundTrace, type RunRecord, type ToolCallTrace } from "@/lib/run-log";
+import { createSkillsMcpServer } from "@/lib/mcp";
+import { getSkillsByIds, type SkillSummary } from "@/lib/skills";
+import { promptHash, truncate, type RoundTrace, type RunRecord, type ToolCallTrace } from "@/lib/run-log";
 
 const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
 const MODEL = process.env.OPENROUTER_MODEL || "anthropic/claude-sonnet-4.5";
@@ -15,6 +17,23 @@ type Message =
   | { role: "system" | "user"; content: string }
   | { role: "assistant"; content: string; tool_calls?: ToolCall[] }
   | { role: "tool"; tool_call_id: string; content: string };
+
+type OpenAiTool = { type: "function"; function: { name: string; description?: string; parameters: unknown } };
+
+/**
+ * Basic JSON mode. Deliberately not `json_schema`: OpenRouter resolves
+ * structured-output support per *endpoint*, and strict schema mode is
+ * supported by materially fewer providers than `json_object` for what is a
+ * single trivial payload shape we validate by hand anyway.
+ */
+type ResponseFormat = { type: "json_object" };
+
+const JSON_OBJECT: ResponseFormat = { type: "json_object" };
+
+const REPAIR_INSTRUCTION =
+  "That reply was not valid JSON. Respond again with only a JSON object — no prose, no code fences — " +
+  'in exactly this shape: {"skills":[{"id":"...","reason":"...","setup":"..."}]}. ' +
+  'Use only skill ids returned by the tools. If nothing in the catalog fits the task, return {"skills":[]}.';
 
 type AssistantReply = {
   content?: string | null;
@@ -43,12 +62,50 @@ export class RecommendError extends Error {
 }
 
 /**
- * Run the OpenRouter tool-calling loop for `task`, appending every round and
- * tool call to `run.trace` as it happens, and return the final recommendation.
- * Throws `RecommendError` on any failure; `run.trace` still reflects progress
- * made before the failure so the caller can log it.
+ * Connect an MCP client to a fresh in-process skills server over a linked
+ * in-memory transport pair. This is the same server `/api/mcp` serves over
+ * HTTP; using it here (rather than a separate tool registry) means the
+ * recommender can never see a different tool surface than any other agent.
+ */
+async function connectInProcessMcpClient(): Promise<Client> {
+  const server = createSkillsMcpServer();
+  const [serverTransport, clientTransport] = InMemoryTransport.createLinkedPair();
+  const client = new Client({ name: "agent-builder-recommender", version: "0.1.0" });
+  await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+  return client;
+}
+
+/** Call one MCP tool and flatten its result to the JSON string the chat loop expects. */
+async function callMcpTool(client: Client, name: string, rawArgs: string): Promise<string> {
+  let args: Record<string, unknown> = {};
+  try {
+    args = rawArgs ? JSON.parse(rawArgs) : {};
+  } catch {
+    return JSON.stringify({ error: "Arguments were not valid JSON" });
+  }
+
+  const result = await client.callTool({ name, arguments: args });
+  if (result.structuredContent !== undefined) return JSON.stringify(result.structuredContent);
+  const text = result.content.find((c): c is { type: "text"; text: string } => c.type === "text")?.text;
+  return text ?? JSON.stringify(result);
+}
+
+/**
+ * Run the OpenRouter tool-calling loop for `task` against the skills MCP
+ * server, appending every round and tool call to `run.trace` as it happens,
+ * and return the final recommendation. Throws `RecommendError` on any
+ * failure; `run.trace` still reflects progress made before the failure so
+ * the caller can log it.
  */
 export async function recommend(task: string, apiKey: string, run: RunRecord): Promise<RecommendResult> {
+  const mcpClient = await connectInProcessMcpClient();
+  const { tools: mcpTools } = await mcpClient.listTools();
+  const openAiTools: OpenAiTool[] = mcpTools.map((t) => ({
+    type: "function",
+    function: { name: t.name, description: t.description, parameters: t.inputSchema },
+  }));
+  run.version.prompt_hash = await promptHash(systemPrompt, openAiTools);
+
   const messages: Message[] = [
     { role: "system", content: systemPrompt },
     { role: "user", content: task },
@@ -65,19 +122,20 @@ export async function recommend(task: string, apiKey: string, run: RunRecord): P
     const roundStarted = Date.now();
     let reply: AssistantReply;
     try {
-      reply = await chat(apiKey, messages, toolChoice);
+      // JSON mode only on rounds that cannot emit tool calls. Mixing
+      // `response_format` with live `tools` is handled inconsistently across
+      // providers, so the search path is left exactly as it was and the
+      // repair round below carries the enforcement instead.
+      reply = await chat(apiKey, messages, openAiTools, toolChoice, forceAnswer ? JSON_OBJECT : undefined);
     } catch (err) {
       throw new RecommendError("model", describeError(err), 502);
     }
     const roundLatency = Date.now() - roundStarted;
 
-    if (reply.usage) {
-      usageTotal.prompt_tokens += reply.usage.prompt_tokens ?? 0;
-      usageTotal.completion_tokens += reply.usage.completion_tokens ?? 0;
-      usageTotal.cost += reply.usage.cost ?? 0;
-    }
+    accumulateUsage(usageTotal, reply.usage);
 
     const calls = reply.tool_calls ?? [];
+    run.trace.tool_call_count += calls.length;
     const toolCallTraces: ToolCallTrace[] = calls.map((c) => ({
       id: c.id,
       name: c.function.name,
@@ -107,7 +165,7 @@ export async function recommend(task: string, apiKey: string, run: RunRecord): P
       results = await Promise.all(
         calls.map(async (c) => {
           const started = Date.now();
-          const result = await runTool(c.function.name, c.function.arguments);
+          const result = await callMcpTool(mcpClient, c.function.name, c.function.arguments);
           const latency_ms = Date.now() - started;
           const { text, truncated, chars } = truncate(result);
           roundTrace.tool_results.push({
@@ -131,36 +189,70 @@ export async function recommend(task: string, apiKey: string, run: RunRecord): P
   run.trace.final_content = content;
   run.usage_total = usageTotal;
 
-  let parsed: { skills?: Recommendation[] };
-  try {
-    parsed = JSON.parse(extractJson(content));
-  } catch {
+  let parsed = tryParseRecommendations(content);
+
+  // One repair round. Format drift on the last message would otherwise throw
+  // away a run that searched the catalog correctly, so re-ask once with tools
+  // disabled and JSON mode on before giving up.
+  if (!parsed) {
+    messages.push({ role: "assistant", content });
+    messages.push({ role: "user", content: REPAIR_INSTRUCTION });
+
+    const repairStarted = Date.now();
+    let reply: AssistantReply;
+    try {
+      reply = await chat(apiKey, messages, openAiTools, "none", JSON_OBJECT);
+    } catch (err) {
+      throw new RecommendError("model", describeError(err), 502);
+    }
+
+    accumulateUsage(usageTotal, reply.usage);
+    content = reply.content ?? "";
+    run.trace.final_content = content;
+    run.trace.rounds.push({
+      index: run.trace.rounds.length,
+      tool_choice: "none",
+      repair: true,
+      latency_ms: Date.now() - repairStarted,
+      generation_id: reply.generation_id,
+      usage: reply.usage,
+      assistant: { content, tool_calls: [] },
+      tool_results: [],
+    });
+
+    parsed = tryParseRecommendations(content);
+  }
+
+  if (!parsed) {
     throw new RecommendError("parse", "Model returned invalid JSON", 502, content);
   }
 
-  const recommendations = (parsed.skills ?? []).filter((r) => r && typeof r.name === "string");
+  const recommendations = (Array.isArray(parsed.skills) ? parsed.skills : []).filter((r) => r && typeof r.id === "string");
 
-  let byName: Map<string, SkillSummary>;
+  let byId: Map<string, SkillSummary>;
   try {
-    const rows = await getSkillsByNames(recommendations.map((r) => r.name));
-    byName = new Map(rows.map((s) => [s.name, s]));
+    const rows = await getSkillsByIds(recommendations.map((r) => r.id));
+    byId = new Map(rows.map((s) => [s.id, s]));
   } catch (err) {
     throw new RecommendError("validate", describeError(err), 502);
   }
 
   const seen = new Set<string>();
   const picked = recommendations
-    .filter((r) => byName.has(r.name) && !seen.has(r.name) && seen.add(r.name))
+    .filter((r) => byId.has(r.id) && !seen.has(r.id) && seen.add(r.id))
     .map((r) => {
-      const row = byName.get(r.name)!;
+      const row = byId.get(r.id)!;
       return { name: row.name, source: row.source, reason: r.reason ?? "", setup: r.setup ?? "", url: row.url };
     });
 
-  run.trace.recommended_names = recommendations.map((r) => r.name);
-  run.trace.dropped_names = recommendations.map((r) => r.name).filter((n) => !byName.has(n));
+  run.trace.recommended_ids = recommendations.map((r) => r.id);
+  run.trace.dropped_ids = recommendations.map((r) => r.id).filter((id) => !byId.has(id));
 
+  // An empty result set is a normal outcome for a search over a finite
+  // catalog, not a server error. `trace.tool_call_count` distinguishes
+  // "nothing matched" from "the agent never searched".
   if (picked.length === 0) {
-    throw new RecommendError("no_matches", "No matching skills recommended", 502, content);
+    return { skills: [], script: "" };
   }
 
   const sources = [...new Set(picked.map((s) => s.source))];
@@ -176,7 +268,13 @@ export async function recommend(task: string, apiKey: string, run: RunRecord): P
   return { skills: picked, script };
 }
 
-async function chat(apiKey: string, messages: Message[], toolChoice: "auto" | "none"): Promise<AssistantReply> {
+async function chat(
+  apiKey: string,
+  messages: Message[],
+  tools: OpenAiTool[],
+  toolChoice: "auto" | "none",
+  responseFormat?: ResponseFormat
+): Promise<AssistantReply> {
   const res = await fetch(OPENROUTER_URL, {
     method: "POST",
     headers: {
@@ -188,6 +286,7 @@ async function chat(apiKey: string, messages: Message[], toolChoice: "auto" | "n
       messages,
       tools,
       tool_choice: toolChoice,
+      ...(responseFormat ? { response_format: responseFormat } : {}),
       usage: { include: true },
     }),
   });
@@ -239,6 +338,28 @@ function parseArgsForTrace(raw: string): unknown {
     return JSON.parse(raw);
   } catch {
     return raw;
+  }
+}
+
+function accumulateUsage(total: { prompt_tokens: number; completion_tokens: number; cost: number }, usage: AssistantReply["usage"]): void {
+  if (!usage) return;
+  total.prompt_tokens += usage.prompt_tokens ?? 0;
+  total.completion_tokens += usage.completion_tokens ?? 0;
+  total.cost += usage.cost ?? 0;
+}
+
+/**
+ * Parse a final assistant message into the recommendation envelope, or return
+ * `null` if it isn't a JSON object. A bare scalar (`"123"`) parses cleanly but
+ * carries no `skills`, so it counts as a failure and earns a repair round.
+ */
+function tryParseRecommendations(content: string): { skills?: Recommendation[] } | null {
+  try {
+    const parsed: unknown = JSON.parse(extractJson(content));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    return parsed as { skills?: Recommendation[] };
+  } catch {
+    return null;
   }
 }
 
