@@ -2,7 +2,7 @@
   <img src="./foglight.svg" alt="Foglight" width="96" />
 </p>
 
-# Foglight
+# Foglight Agent Builder
 
 Turn a task into a skill pack for your coding agent.
 

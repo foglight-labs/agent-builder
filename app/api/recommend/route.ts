@@ -1,6 +1,17 @@
 import { systemPrompt } from "@/lib/prompt";
-import { describeError, MAX_TOOL_ROUNDS, MODEL, recommend, RecommendError } from "@/lib/recommend";
+import { describeError, MAX_TOOL_ROUNDS, MODEL, recommend, RecommendError, type RecommendResult } from "@/lib/recommend";
 import { logRun, newRunId, type RunRecord } from "@/lib/run-log";
+
+/**
+ * One line of the newline-delimited JSON stream this route returns. `status`
+ * lines carry live progress (model/tool-call activity) so the client can
+ * show something better than a static "Thinking…" label; `result`/`error`
+ * are always the last line.
+ */
+type StreamEvent =
+  | { type: "status"; message: string }
+  | ({ type: "result"; run_id: string } & RecommendResult)
+  | { type: "error"; message: string; raw?: string; run_id: string };
 
 export async function POST(request: Request) {
   const apiKey = process.env.OPENROUTER_API_KEY;
@@ -36,20 +47,30 @@ export async function POST(request: Request) {
     trace: { system_prompt: systemPrompt, rounds: [], tool_call_count: 0, trimmed: false },
   };
 
-  try {
-    const result = await recommend(trimmedTask, apiKey, run);
-    run.output = result;
-    return Response.json({ skills: result.skills, script: result.script, run_id: run.id });
-  } catch (err) {
-    const recErr = err instanceof RecommendError ? err : new RecommendError("unknown", describeError(err), 502);
-    run.status = "error";
-    run.error = { stage: recErr.stage, message: recErr.message };
-    const body: { error: string; raw?: string; run_id: string } = { error: recErr.message, run_id: run.id };
-    if (recErr.raw) body.raw = recErr.raw;
-    return Response.json(body, { status: recErr.status });
-  } finally {
-    run.finished_at = new Date().toISOString();
-    run.duration_ms = Date.parse(run.finished_at) - Date.parse(run.started_at);
-    await logRun(run);
-  }
+  const encoder = new TextEncoder();
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      const send = (event: StreamEvent) => controller.enqueue(encoder.encode(JSON.stringify(event) + "\n"));
+
+      try {
+        const result = await recommend(trimmedTask, apiKey, run, (message) => send({ type: "status", message }));
+        run.output = result;
+        send({ type: "result", run_id: run.id, ...result });
+      } catch (err) {
+        const recErr = err instanceof RecommendError ? err : new RecommendError("unknown", describeError(err), 502);
+        run.status = "error";
+        run.error = { stage: recErr.stage, message: recErr.message };
+        send({ type: "error", message: recErr.message, raw: recErr.raw, run_id: run.id });
+      } finally {
+        run.finished_at = new Date().toISOString();
+        run.duration_ms = Date.parse(run.finished_at) - Date.parse(run.started_at);
+        await logRun(run);
+        controller.close();
+      }
+    },
+  });
+
+  return new Response(stream, {
+    headers: { "Content-Type": "application/x-ndjson; charset=utf-8", "Cache-Control": "no-cache" },
+  });
 }

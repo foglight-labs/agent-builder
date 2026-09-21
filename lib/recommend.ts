@@ -2,6 +2,7 @@ import { Client } from "@modelcontextprotocol/client";
 import { InMemoryTransport } from "@modelcontextprotocol/client";
 import { systemPrompt, type Recommendation } from "@/lib/prompt";
 import { createSkillsMcpServer } from "@/lib/mcp";
+import { buildInstallScript } from "@/lib/script";
 import { getSkillsByIds, type SkillSummary } from "@/lib/skills";
 import { promptHash, truncate, type RoundTrace, type RunRecord, type ToolCallTrace } from "@/lib/run-log";
 
@@ -91,13 +92,41 @@ async function callMcpTool(client: Client, name: string, rawArgs: string): Promi
 }
 
 /**
+ * Describe a tool call in human terms for `onProgress`, e.g. for a status
+ * line shown to the user while the agent is working.
+ */
+function describeToolCall(name: string, rawArgs: string): string {
+  let args: Record<string, unknown> = {};
+  try {
+    args = rawArgs ? JSON.parse(rawArgs) : {};
+  } catch {
+    // fall through with empty args
+  }
+  if (name === "search_skills") {
+    const query = typeof args.query === "string" ? args.query.trim() : "";
+    return query ? `Searching for "${query}"\u2026` : "Listing the full catalog\u2026";
+  }
+  if (name === "get_skill") {
+    const id = typeof args.id === "string" ? args.id : "";
+    return id ? `Reading ${id}\u2026` : "Reading skill details\u2026";
+  }
+  return `Running ${name}\u2026`;
+}
+
+/**
  * Run the OpenRouter tool-calling loop for `task` against the skills MCP
  * server, appending every round and tool call to `run.trace` as it happens,
  * and return the final recommendation. Throws `RecommendError` on any
  * failure; `run.trace` still reflects progress made before the failure so
- * the caller can log it.
+ * the caller can log it. `onProgress`, if given, is called with a short
+ * human-readable status line before each model call and each tool call.
  */
-export async function recommend(task: string, apiKey: string, run: RunRecord): Promise<RecommendResult> {
+export async function recommend(
+  task: string,
+  apiKey: string,
+  run: RunRecord,
+  onProgress?: (message: string) => void
+): Promise<RecommendResult> {
   const mcpClient = await connectInProcessMcpClient();
   const { tools: mcpTools } = await mcpClient.listTools();
   const openAiTools: OpenAiTool[] = mcpTools.map((t) => ({
@@ -119,6 +148,7 @@ export async function recommend(task: string, apiKey: string, run: RunRecord): P
     const forceAnswer = round >= MAX_TOOL_ROUNDS;
     const toolChoice: "auto" | "none" = forceAnswer ? "none" : "auto";
 
+    onProgress?.("Thinking\u2026");
     const roundStarted = Date.now();
     let reply: AssistantReply;
     try {
@@ -160,6 +190,8 @@ export async function recommend(task: string, apiKey: string, run: RunRecord): P
 
     messages.push({ role: "assistant", content: reply.content ?? "", tool_calls: calls });
 
+    calls.forEach((c) => onProgress?.(describeToolCall(c.function.name, c.function.arguments)));
+
     let results: string[];
     try {
       results = await Promise.all(
@@ -198,6 +230,7 @@ export async function recommend(task: string, apiKey: string, run: RunRecord): P
     messages.push({ role: "assistant", content });
     messages.push({ role: "user", content: REPAIR_INSTRUCTION });
 
+    onProgress?.("Thinking\u2026");
     const repairStarted = Date.now();
     let reply: AssistantReply;
     try {
@@ -255,15 +288,7 @@ export async function recommend(task: string, apiKey: string, run: RunRecord): P
     return { skills: [], script: "" };
   }
 
-  const sources = [...new Set(picked.map((s) => s.source))];
-  const script = [
-    "#!/usr/bin/env bash",
-    `# Skill pack for: ${task.replace(/\s+/g, " ")}`,
-    `# Sources: ${sources.join(", ")}`,
-    "set -e",
-    "",
-    ...picked.flatMap((s) => [`# ${s.name}: ${s.reason}`, `npx skills add ${s.source} --skill ${s.name} -y`, ""]),
-  ].join("\n");
+  const script = buildInstallScript(picked);
 
   return { skills: picked, script };
 }
