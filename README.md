@@ -68,3 +68,18 @@ npm test
 `lib/mcp.test.ts` exercises the MCP server end-to-end (list tools, call each one, both error paths) through an in-memory MCP client, with `lib/skills.ts` mocked — no database needed.
 
 `lib/recommend.test.ts` covers the tool-calling loop against scripted OpenRouter replies (`fetch` stubbed, `lib/skills.ts` mocked): the repair round, empty result sets, `tool_call_count`, and which rounds carry `response_format`.
+
+## Deploy (Railway)
+The repo ships a `Dockerfile` (Next.js `output: "standalone"`) and a `railway.json`, so
+Railway just needs to build and run it:
+
+1. Railway → **New Project** → **Deploy from GitHub repo** → pick this repo. Railway
+   detects the `Dockerfile` automatically.
+2. **Variables** → add `OPENROUTER_API_KEY`, `MEILISEARCH_HOST`, and `MEILISEARCH_API_KEY`
+   (plus the optional `OPENROUTER_MODEL` / `MEILISEARCH_INDEX` overrides — see `.env.example`).
+3. **Settings → Networking → Custom Domain** → add `try.foglight.co`. Railway shows a
+   CNAME target for it.
+4. In Cloudflare DNS for `foglight.co`, add `CNAME try → <target Railway gave you>`.
+   Either proxy it (orange cloud, with SSL/TLS mode set to **Full (strict)**) or leave it
+   DNS-only — both work.
+5. `/api/health` is the healthcheck endpoint Railway polls during deploys.

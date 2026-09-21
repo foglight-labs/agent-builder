@@ -30,6 +30,8 @@ function tryExec(command: string): string | null {
 }
 
 const nextConfig: NextConfig = {
+  // Emits .next/standalone with a minimal server.js for the Docker image used on Railway.
+  output: "standalone",
   env: {
     GIT_COMMIT: resolveGitCommit(),
     GIT_DIRTY: resolveGitDirty(),
