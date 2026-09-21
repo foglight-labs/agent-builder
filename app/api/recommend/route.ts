@@ -7,8 +7,8 @@ export async function POST(request: Request) {
   if (!apiKey) {
     return Response.json({ error: "OPENROUTER_API_KEY is not set" }, { status: 500 });
   }
-  if (!process.env.DATABASE_URL) {
-    return Response.json({ error: "DATABASE_URL is not set" }, { status: 500 });
+  if (!process.env.MEILISEARCH_HOST || !process.env.MEILISEARCH_API_KEY) {
+    return Response.json({ error: "MEILISEARCH_HOST/MEILISEARCH_API_KEY are not set" }, { status: 500 });
   }
 
   const { task } = (await request.json().catch(() => ({}))) as { task?: string };
