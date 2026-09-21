@@ -16,6 +16,101 @@ main {
   padding: 2rem 1rem 4rem;
 }
 
+.site-header {
+  margin-bottom: 1rem;
+}
+
+.brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  color: inherit;
+  text-decoration: none;
+}
+
+.brand span {
+  font-size: 1.5rem;
+  font-weight: 700;
+}
+
+.brand:hover span {
+  text-decoration: underline;
+}
+
+.mode-toggle {
+  display: inline-flex;
+  gap: 0.25rem;
+  padding: 0.25rem;
+  background: #f4f4f4;
+  border-radius: 8px;
+  margin-bottom: 1rem;
+}
+
+.mode-toggle button {
+  align-self: auto;
+  border: none;
+  background: transparent;
+  border-radius: 6px;
+  padding: 0.4rem 0.9rem;
+}
+
+.mode-toggle button.active {
+  background: #fff;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.15);
+  font-weight: 600;
+}
+
+.presets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-bottom: 1rem;
+}
+
+.presets button {
+  align-self: auto;
+  font-size: 0.85em;
+  padding: 0.35rem 0.75rem;
+  border: 1px solid #ddd;
+  border-radius: 999px;
+  background: #fff;
+  color: #333;
+}
+
+.presets button:hover {
+  background: #f4f4f4;
+}
+
+.thinking {
+  margin: 0.75rem 0;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid #eee;
+  border-radius: 8px;
+  background: #fafafa;
+}
+
+.thinking summary {
+  cursor: pointer;
+  color: #555;
+  font-style: italic;
+  list-style: revert;
+}
+
+.thinking[open] summary {
+  margin-bottom: 0.5rem;
+}
+
+.thinking ol {
+  margin: 0;
+  padding-left: 1.25rem;
+  color: #555;
+  font-size: 0.9em;
+}
+
+.thinking li {
+  margin-bottom: 0.25rem;
+}
+
 form {
   display: flex;
   flex-direction: column;
