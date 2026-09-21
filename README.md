@@ -2,32 +2,19 @@
 Turn any task into an optimal agent harness from open-source components.
 
 ## MVP v0
-A Postgres skills catalog is served over MCP: any MCP client (Claude Code, Codex, Droid, a custom agent, ...) can search it and pull a skill's install command directly, over `POST /api/mcp`. The web UI is one such client — it runs an LLM agent over the same two tools to turn a task description into a recommended skill pack and a copyable `npx skills add` install script.
+A skills catalog (backed by a hosted Meilisearch index) is served over MCP: any MCP client (Claude Code, Codex, Droid, a custom agent, ...) can search it and pull a skill's install command directly, over `POST /api/mcp`. The web UI is one such client — it runs an LLM agent over the same two tools to turn a task description into a recommended skill pack and a copyable `npx skills add` install script.
 
 ## Run
 ```bash
-cp .env.example .env.local   # set OPENROUTER_API_KEY and DATABASE_URL
+cp .env.example .env.local   # set OPENROUTER_API_KEY and MEILISEARCH_API_KEY
 npm install
 npm run dev
 ```
 
-## Catalog database
-Skills live in Postgres (Supabase in production, any local Postgres in dev). This repo only **reads**; ingestion is owned by a separate repository. `db/schema.sql` is the contract between the two:
+## Search index
+The skills catalog is served from a hosted Meilisearch index (`MEILISEARCH_HOST`, default `https://search.foglight.co`) using a search-scoped `MEILISEARCH_API_KEY`. It is the **only** source for the catalog — there is no fallback if it's unreachable. This repo only reads from it (`POST /indexes/<MEILISEARCH_INDEX>/search`, default index `skills`); the index itself is populated and maintained by a separate system.
 
-- `skills` — one row per skill: `source` (e.g. `mattpocock/skills`), `name`, `description`, `url`, `metadata jsonb`.
-- `skill_files` — the skill's files as `bytea` (`SKILL.md`, scripts, …), keyed by `(skill_id, path)`.
-
-Apply the schema once as an admin, after replacing the `CHANGE_ME` password for the `skills_reader` role:
-
-```bash
-# local
-createdb skills
-psql skills -f db/schema.sql
-
-# Supabase: paste db/schema.sql into the SQL editor
-```
-
-Then point `DATABASE_URL` at the database as `skills_reader` (see `.env.example`; for Supabase use the transaction-pooler URL with `?sslmode=require`).
+Each document carries `repo` (`owner/repo`, our `source`), `name`, `description`, `url`, `frontmatter` (our `metadata`), `files`, and more — see `lib/meilisearch.ts` for the full shape and `lib/skills.ts` for how it's mapped onto the catalog's public types.
 
 ## MCP server
 `POST /api/mcp` speaks MCP (Streamable HTTP, stateless — no session, no auth yet) over two read-only tools backed by parameterized queries. `lib/mcp.ts` is the single source of truth for both; `/api/mcp` and the recommender below connect to the same server definition, so they can never drift apart.
@@ -50,7 +37,7 @@ Point any MCP client at it, for example:
 (Claude Code, Cursor, and most clients accept this `url`-style entry directly; Codex and Droid config formats differ slightly — see each tool's MCP docs.)
 
 ## How recommendations work
-`POST /api/recommend` runs a tool-calling loop against OpenRouter, connected to an in-process instance of the same MCP server (over an in-memory transport — no extra network hop). The model never writes SQL and only sees `search_skills`/`get_skill`; picked ids are validated against the database before the install script is generated.
+`POST /api/recommend` runs a tool-calling loop against OpenRouter, connected to an in-process instance of the same MCP server (over an in-memory transport — no extra network hop). The model only sees `search_skills`/`get_skill`; picked ids are validated against the catalog before the install script is generated.
 
 A query that matches nothing is a normal `200` with `skills: []`, not an error — this is a search over a finite catalog. Only genuine failures (model, tool, validation, unparseable output) return `502`.
 
