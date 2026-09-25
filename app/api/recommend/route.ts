@@ -1,6 +1,7 @@
 import { systemPrompt } from "@/lib/prompt";
 import { describeError, MAX_TOOL_ROUNDS, MODEL, recommend, RecommendError, type RecommendResult } from "@/lib/recommend";
 import { logRun, newRunId, type RunRecord } from "@/lib/run-log";
+import { requireApiAccess } from "@/lib/viewer";
 
 /**
  * One line of the newline-delimited JSON stream this route returns. `status`
@@ -14,6 +15,11 @@ type StreamEvent =
   | { type: "error"; message: string; raw?: string; run_id: string };
 
 export async function POST(request: Request) {
+  // Invite-mode wall (no-op in open mode). Before everything else: deny
+  // cheaply rather than leaking config errors or burning model tokens.
+  const denied = await requireApiAccess();
+  if (denied) return denied;
+
   const apiKey = process.env.OPENROUTER_API_KEY;
   if (!apiKey) {
     return Response.json({ error: "OPENROUTER_API_KEY is not set" }, { status: 500 });

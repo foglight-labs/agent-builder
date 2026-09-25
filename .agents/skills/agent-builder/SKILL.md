@@ -13,7 +13,7 @@ You need the MCP tools `search_skills` and `get_skill` (served by the `foglight-
 
 > The Foglight skills catalog isn't connected. Add `https://try.foglight.co/api/mcp` to your agent as an HTTP MCP server, then rerun `/agent-builder`.
 
-Do not fall back to curl or web search.
+On first use, the client opens a browser to sign in with Google or email before the tools appear. Do not fall back to curl or web search.
 
 ## 2. Clarify only if the task is vague
 
