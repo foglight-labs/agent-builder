@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "effective-agent-skills": {
+      "source": "sickn33/agentic-awesome-skills",
+      "sourceType": "github",
+      "skillPath": "skills/effective-agent-skills/SKILL.md",
+      "computedHash": "6d49d32d835a0995ba9f415e78cefb39819b887fba1f54268c8fcd251a8bd329"
+    }
+  }
+}

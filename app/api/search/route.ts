@@ -1,5 +1,6 @@
 import { buildInstallScript } from "@/lib/script";
 import { searchSkills } from "@/lib/skills";
+import { requireApiAccess } from "@/lib/viewer";
 
 const RESULT_LIMIT = 10;
 
@@ -9,6 +10,10 @@ const RESULT_LIMIT = 10;
  * calls a model, so there's no cost/tool trace worth logging as a run.
  */
 export async function POST(request: Request) {
+  // Invite-mode wall (no-op in open mode).
+  const denied = await requireApiAccess();
+  if (denied) return denied;
+
   if (!process.env.MEILISEARCH_HOST || !process.env.MEILISEARCH_API_KEY) {
     return Response.json({ error: "MEILISEARCH_HOST/MEILISEARCH_API_KEY are not set" }, { status: 500 });
   }
